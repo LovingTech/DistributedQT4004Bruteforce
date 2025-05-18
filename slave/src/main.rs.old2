@@ -1,0 +1,89 @@
+// === slave.rs ===
+use qt4004core::{QT4004, program_from_seed};
+use serde::{Deserialize, Serialize};
+use std::{env, io::{Read, Write}, net::TcpStream, thread};
+
+#[derive(Clone, Serialize, Deserialize)]
+struct WorkBatch {
+    start: u128,
+    end: u128,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct WorkResult {
+    best_program: [i8; 16],
+    steps: u64,
+}
+
+fn worker(thread_id: usize, start: u128, end: u128, stride: usize) -> (u64, [i8; 16]) {
+    let mut best_steps: u64 = 0;
+    let mut best_program: [i8; 16] = [0; 16];
+    let mut processor = QT4004::new();
+
+    for x in (start + thread_id as u128..end).step_by(stride) {
+        let program = program_from_seed(x);
+        processor.load(program);
+        let steps = processor.run();
+        if steps > best_steps {
+            best_steps = steps;
+            best_program = program;
+        }
+    }
+    (best_steps, best_program)
+}
+
+fn main() {
+    let args: Vec<String> = env::args().collect();
+
+    let server_addr = args.get(1).map(|s| s.as_str()).unwrap_or("127.0.0.1:7878");
+
+    // Second argument: number of worker threads, default to 4
+    let thread_count: usize = args
+        .get(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4);
+    
+    loop {
+        match TcpStream::connect(server_addr) {
+            Ok(mut stream) => {
+                let mut buffer = [0; 1024];
+                if let Ok(n) = stream.read(&mut buffer) {
+                    if let Ok(batch) = serde_json::from_slice::<WorkBatch>(&buffer[..n]) {
+                        println!("Received batch: {} -> {}", batch.start, batch.end);
+
+                        let mut threads = vec![];
+                        for t in 0..thread_count {
+                            let (start, end) = (batch.start, batch.end);
+                            threads.push(thread::spawn(move || worker(t, start, end, thread_count)));
+                        }
+
+                        let mut best_steps = 0;
+                        let mut best_program = [0; 16];
+
+                        for handle in threads {
+                            if let Ok((steps, program)) = handle.join() {
+                                if steps > best_steps {
+                                    best_steps = steps;
+                                    best_program = program;
+                                }
+                            }
+                        }
+
+                        let result = WorkResult {
+                            best_program,
+                            steps: best_steps,
+                        };
+
+                        let json = serde_json::to_vec(&result).unwrap();
+                        let _ = stream.write_all(&json);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Connection error: {}", e);
+                thread::sleep(std::time::Duration::from_secs(2));
+            }
+        }
+    }
+}
+
